@@ -98,6 +98,12 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         self.send_to_tokenizer = get_zmq_socket(
             context, zmq.PUSH, port_args.tokenizer_ipc_name, False
         )
+        self.send_to_controller = get_zmq_socket(
+            context, zmq.PUSH, port_args.heartbeat_ipc_name, False
+        )
+        self.send_to_controller = get_zmq_socket(
+            context, zmq.PUSH, port_args.heartbeat_ipc_name, False
+        )
 
     def init_tokenizer(self, server_args: ServerArgs):
         if server_args.skip_tokenizer_init:
@@ -141,6 +147,16 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output = self._request_dispatcher(recv_obj)
             if output is not None:
                 self.send_to_tokenizer.send_pyobj(output)
+                if hasattr(output, "finished_reasons") and hasattr(output, "rids"):
+                    finished_rids = [
+                        rid
+                        for rid, reason in zip(output.rids, output.finished_reasons)
+                        if reason
+                    ]
+                    if finished_rids:
+                        self.send_to_controller.send_pyobj(
+                            {"type": "ack", "rids": finished_rids}
+                        )
             self.soft_watchdog.feed()
 
     def trim_matched_stop(

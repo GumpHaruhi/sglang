@@ -19,6 +19,7 @@ import os
 import signal
 import sys
 import time
+import threading
 from collections import deque
 from concurrent import futures
 from dataclasses import dataclass
@@ -385,6 +386,16 @@ class Scheduler(
                 context, zmq.DEALER, port_args.rpc_ipc_name, False
             )
 
+            # Heartbeat sender
+            self.send_heartbeat = get_zmq_socket(
+                context, zmq.PUSH, port_args.heartbeat_ipc_name, False
+            )
+            # Start heartbeat thread
+            self.heartbeat_thread = threading.Thread(
+                target=self._run_heartbeat_loop, daemon=True
+            )
+            self.heartbeat_thread.start()
+
             send_to_tokenizer = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_ipc_name, False
             )
@@ -419,6 +430,15 @@ class Scheduler(
             self.send_metrics_from_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.metrics_ipc_name, False
             )
+
+    def _run_heartbeat_loop(self):
+        while True:
+            rank = self.dp_rank if self.dp_rank is not None else 0
+            try:
+                self.send_heartbeat.send_pyobj({"type": "heartbeat", "rank": rank})
+            except Exception:
+                pass
+            time.sleep(1.0)
 
     def init_tokenizer(self):
         server_args = self.server_args
@@ -464,6 +484,18 @@ class Scheduler(
 
         # This must be called after initialize_moe_config
         self.require_mlp_sync = require_mlp_sync(self.server_args)
+
+    def _run_heartbeat_loop(self):
+        while True:
+            try:
+                self.send_heartbeat.send_pyobj({
+                    "type": "heartbeat",
+                    "rank": self.dp_rank if self.dp_rank is not None else 0,
+                    "timestamp": time.time()
+                })
+            except Exception as e:
+                logger.error(f"Heartbeat failed: {e}")
+            time.sleep(1.0)
 
     def init_model_worker(self):
         from sglang.srt.managers.tp_worker import TpModelWorker

@@ -18,6 +18,7 @@ import logging
 import multiprocessing as mp
 import signal
 import threading
+import uuid
 import time
 from collections import deque
 from enum import Enum, auto
@@ -164,11 +165,18 @@ class DataParallelController:
         # For DP balance
         self.global_balance_id = 0
 
+        # For fault tolerance
+        self.inflight_batches = {}
+        self.rid_to_batch_uuid = {}
+
         # Init inter-process communication
         self.context = zmq.Context(1 + server_args.dp_size)
         if server_args.node_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
+            )
+            self.recv_heartbeat = get_zmq_socket(
+                 self.context, zmq.PULL, port_args.heartbeat_ipc_name, True
             )
 
         # Dispatch method
@@ -206,6 +214,10 @@ class DataParallelController:
             soft=True,
             test_stuck_time=envs.SGLANG_TEST_STUCK_DP_CONTROLLER.get(),
         )
+
+        self.worker_last_heartbeat = {i: time.time() for i in range(server_args.dp_size)}
+        self.worker_status = {i: "healthy" for i in range(server_args.dp_size)}
+        self.heartbeat_timeout = 5.0  # seconds
 
     def send_to_all_workers(self, obj):
         for worker in self.workers:
@@ -251,6 +263,7 @@ class DataParallelController:
             tmp_port_args = PortArgs.init_new(server_args)
             tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
             tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
+            tmp_port_args.heartbeat_ipc_name = port_args.heartbeat_ipc_name
 
             # This port is checked free in PortArgs.init_new.
             # We hold it first so that the next dp worker gets a different port
@@ -499,7 +512,8 @@ class DataParallelController:
 
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.data_parallel_rank is not None:
-            logger.debug(f"Direct routing to DP rank {req.data_parallel_rank}")
+            # logger.debug(f"Direct routing to DP rank {req.data_parallel_rank}")
+            logger.info(f"Direct routing req {req.rid} to DP rank {req.data_parallel_rank}")
             self.workers[req.data_parallel_rank].send_pyobj(req)
             return True
         return False
@@ -509,7 +523,20 @@ class DataParallelController:
             return
 
         if self.server_args.disaggregation_mode == "null":
-            self.workers[self.round_robin_counter].send_pyobj(req)
+            # Attempt to find a healthy worker
+            workers_count = len(self.workers)
+            start_idx = self.round_robin_counter
+            
+            for i in range(workers_count):
+                idx = (start_idx + i) % workers_count
+                if self.worker_status.get(idx, "healthy") == "healthy":
+                    logger.info(f"Dispatching req {req.rid} to worker {idx}")
+                    self.send_req_to_worker(req, idx)
+                    self.round_robin_counter = (idx + 1) % workers_count
+                    return
+            
+            logger.error(f"All workers unhealthy! Forcing dispatch to {self.round_robin_counter}")
+            self.send_req_to_worker(req, self.round_robin_counter)
             self.round_robin_counter = (self.round_robin_counter + 1) % len(
                 self.workers
             )
@@ -528,14 +555,14 @@ class DataParallelController:
                 req.bootstrap_room is not None
             ), "req.bootstrap_room should not be None. Do not send requests directly to prefill or decode instances, but send to the router instead."
             target_rank = req.bootstrap_room % len(self.workers)
-            self.workers[target_rank].send_pyobj(req)
+            self.send_req_to_worker(req, target_rank)
 
     def decode_round_robin_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
 
         if self.server_args.disaggregation_mode == "decode":
-            self.workers[self.round_robin_counter].send_pyobj(req)
+            self.send_req_to_worker(req, self.round_robin_counter)
             self.round_robin_counter = (self.round_robin_counter + 1) % len(
                 self.workers
             )
@@ -546,10 +573,16 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
         target_worker = self.dp_budget.dispatch()
+
+        # Check if the chosen worker is healthy
+        if target_worker is not None and self.worker_status.get(target_worker, "healthy") == "unhealthy":
+            target_worker = None
+
         if target_worker is None:
             self.round_robin_scheduler(req)
         else:
-            self.workers[target_worker].send_pyobj(req)
+            logger.info(f"Dispatching req {req.rid} to worker {target_worker}")
+            self.send_req_to_worker(req, target_worker)
 
     def minimum_tokens_scheduler(self, req):
         if self.maybe_external_dp_rank_routing(req):
@@ -561,8 +594,91 @@ class DataParallelController:
         )
         self.round_robin_scheduler(req)
 
+    def send_req_to_worker(self, req, worker_idx):
+        if hasattr(req, "rids"):
+            # Track inflight request
+            batch_uuid = uuid.uuid4().hex
+            self.inflight_batches[batch_uuid] = {
+                "req": req,
+                "worker": worker_idx,
+                "rids": set(req.rids),
+            }
+            for rid in req.rids:
+                self.rid_to_batch_uuid[rid] = batch_uuid
+        
+        try:
+            self.workers[worker_idx].send_pyobj(req, flags=zmq.NOBLOCK)
+        except zmq.ZMQError:
+            logger.error(f"Failed to send request to worker {worker_idx}. Marking as unhealthy.")
+            self.worker_status[worker_idx] = "unhealthy"
+            self.handle_worker_failure(worker_idx)
+
+    def handle_ack(self, rids):
+        for rid in rids:
+            batch_uuid = self.rid_to_batch_uuid.pop(rid, None)
+            if batch_uuid:
+                batch_info = self.inflight_batches.get(batch_uuid)
+                if batch_info:
+                    if rid in batch_info["rids"]:
+                        batch_info["rids"].remove(rid)
+                    if not batch_info["rids"]:
+                        del self.inflight_batches[batch_uuid]
+
+    def handle_worker_failure(self, failed_rank):
+        failed_uuids = [
+            uuid_key for uuid_key, info in self.inflight_batches.items()
+            if info["worker"] == failed_rank
+        ]
+        
+        if not failed_uuids:
+            return
+
+        logger.error(f"Worker {failed_rank} failed. Resending {len(failed_uuids)} batches.")
+        
+        for uuid_key in failed_uuids:
+            info = self.inflight_batches.pop(uuid_key)
+            # Remove remaining RIDs from access map
+            for rid in info["rids"]:
+                self.rid_to_batch_uuid.pop(rid, None)
+            
+            # Resend the batch
+            # We must be careful not to infinite loop if all workers down.
+            # dispatching() checks worker health.
+            # If all unhealthy, it drops.
+            # Because we pop from inflight_batches, we won't loop forever on the same batch if it drops.
+            req = info["req"]
+            self.dispatching(req)
+
     def event_loop(self):
         while True:
+            # Check heartbeats
+            while True:
+                try:
+                    msg = self.recv_heartbeat.recv_pyobj(zmq.NOBLOCK)
+                    if msg.get("type") == "ack":
+                        self.handle_ack(msg["rids"])
+                        continue
+
+                    hb = msg
+                    if "rank" not in hb:
+                        continue
+                    self.worker_last_heartbeat[hb["rank"]] = time.time()
+                    if self.worker_status[hb["rank"]] == "unhealthy":
+                        logger.info(f"Worker {hb['rank']} recovered (heartbeat received)")
+                        self.worker_status[hb["rank"]] = "healthy"
+                except zmq.ZMQError:
+                    break
+            
+            # Check for timeouts
+            current_time = time.time()
+            for rank in range(self.server_args.dp_size):
+                last_hb = self.worker_last_heartbeat.get(rank, current_time) # Default to active at start?
+                # Actually we should initialize active time at start.
+                if self.worker_status[rank] == "healthy" and (current_time - last_hb > self.heartbeat_timeout):
+                    logger.error(f"Worker {rank} heartbeat timeout! Marking as unhealthy.")
+                    self.worker_status[rank] = "unhealthy"
+                    self.handle_worker_failure(rank)
+
             while True:
                 self.soft_watchdog.feed()
                 try:
@@ -571,6 +687,7 @@ class DataParallelController:
                     break
                 self._request_dispatcher(recv_req)
 
+            time.sleep(0.002)
 
 def run_data_parallel_controller_process(
     server_args: ServerArgs,
